@@ -1,9 +1,6 @@
 #pragma once
 
-#include <boost/asio.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
-#include <limits>
+#include <asio.hpp>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -58,23 +55,8 @@ public:
 
 private:
   struct CollectionContext;
-  using HttpRequest = boost::beast::http::request<boost::beast::http::vector_body<uint8_t>>;
-  using HttpResponse = boost::beast::http::response<boost::beast::http::vector_body<uint8_t>>;
-
-  boost::asio::io_context io_context_;
-  boost::asio::ip::tcp::resolver resolver_;
-  boost::beast::tcp_stream stream_;
-  boost::beast::flat_buffer buffer_;
-  std::string host_;
-  std::string port_;
-
-  void ensureConnection();
-  void closeStream();
-  HttpResponse performPost(const std::string &target,
-                           std::vector<uint8_t> &&body,
-                           bool close = false);
-  HttpResponse performDelete(const std::string &target);
-
+  asio::io_context io_context_;
+  asio::ip::tcp::socket socket_;
   std::unordered_map<std::string, std::unique_ptr<CollectionContext>>
       collections_;
   std::unordered_map<std::string, u64> db_sizes_;
@@ -83,7 +65,6 @@ private:
 
   unsigned char aesKey_[AES_KEY_SIZE];
   bool aesKeyGenerated_ = false;
-  const std::size_t max_body_size_{std::numeric_limits<std::size_t>::max()};
 };
 
 } // namespace evd

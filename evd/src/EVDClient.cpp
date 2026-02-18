@@ -1,19 +1,12 @@
 #include "evd/EVDClient.hpp"
 
-#include <algorithm>
-#include <cstdint>
-#include <boost/asio/connect.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
-#include <boost/beast/version.hpp>
+#include <asio/write.hpp>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <openssl/aes.h>
 #include <openssl/err.h>
@@ -28,6 +21,7 @@
 #include "evd/Ciphertext.hpp"
 #include "evd/Client.hpp"
 #include "evd/Const.hpp"
+#include "evd/EVDOperation.hpp"
 #include "evd/MLWECiphertext.hpp"
 #include "evd/Message.hpp"
 #include "evd/MetricType.hpp"
@@ -36,8 +30,6 @@
 namespace evd {
 
 namespace {
-
-namespace http = boost::beast::http;
 
 void logToFile(const std::string &message) {
   const char *log_path_env = std::getenv("EVD_CLIENT_LOG_PATH");
@@ -188,47 +180,6 @@ bool loadAesKey(const std::string &path, unsigned char *key) {
   return file.gcount() == AES_KEY_SIZE;
 }
 
-struct BinaryReader {
-  const std::vector<uint8_t> &buffer;
-  std::size_t pos{0};
-
-  explicit BinaryReader(const std::vector<uint8_t> &buf) : buffer(buf) {}
-
-  template <typename T> bool read(T &value) {
-    if (pos + sizeof(T) > buffer.size()) {
-      return false;
-    }
-    std::memcpy(&value, buffer.data() + pos, sizeof(T));
-    pos += sizeof(T);
-    return true;
-  }
-
-  bool readBytes(void *dest, std::size_t len) {
-    if (pos + len > buffer.size()) {
-      return false;
-    }
-    std::memcpy(dest, buffer.data() + pos, len);
-    pos += len;
-    return true;
-  }
-};
-
-template <typename T>
-void appendBinary(std::vector<uint8_t> &out, const T &value) {
-  const auto *ptr = reinterpret_cast<const uint8_t *>(&value);
-  out.insert(out.end(), ptr, ptr + sizeof(T));
-}
-
-inline void appendBinary(std::vector<uint8_t> &out, const void *data,
-                         std::size_t len) {
-  const auto *ptr = static_cast<const uint8_t *>(data);
-  out.insert(out.end(), ptr, ptr + len);
-}
-
-std::string vectorToString(const std::vector<uint8_t> &data) {
-  return std::string(data.begin(), data.end());
-}
-
 } // namespace
 
 struct EVDClient::CollectionContext {
@@ -290,8 +241,10 @@ MetricType stringToMetricType(const std::string &s) {
 }
 
 EVDClient::EVDClient(const std::string &host, const std::string &port)
-    : resolver_(io_context_), stream_(io_context_), host_(host), port_(port) {
-  ensureConnection();
+    : socket_(io_context_) {
+  asio::ip::tcp::resolver resolver(io_context_);
+  auto endpoints = resolver.resolve(host, port);
+  asio::connect(socket_, endpoints);
 
   const char *sec_key_path_env = std::getenv("EVD_SEC_KEY_PATH");
   std::string sec_key_path =
@@ -337,102 +290,6 @@ EVDClient::~EVDClient() {
   }
 }
 
-void EVDClient::ensureConnection() {
-  if (stream_.socket().is_open()) {
-    return;
-  }
-  auto endpoints = resolver_.resolve(host_, port_);
-  stream_.connect(endpoints);
-}
-
-void EVDClient::closeStream() {
-  boost::beast::error_code ec;
-  if (stream_.socket().is_open()) {
-    stream_.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-    stream_.socket().close(ec);
-  }
-  buffer_.consume(buffer_.size());
-}
-
-EVDClient::HttpResponse
-EVDClient::performPost(const std::string &target, std::vector<uint8_t> &&body,
-                       bool close) {
-  ensureConnection();
-
-  HttpRequest req{http::verb::post, target, 11};
-  req.set(http::field::host, host_);
-  req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-  req.set(http::field::content_type, "application/octet-stream");
-  if (close) {
-    req.set(http::field::connection, "close");
-  }
-  req.body() = std::move(body);
-  req.prepare_payload();
-
-  http::write(stream_, req);
-
-  http::response_parser<HttpResponse::body_type> parser;
-  parser.body_limit(static_cast<std::uint64_t>(max_body_size_));
-  try {
-    http::read(stream_, buffer_, parser);
-  } catch (const boost::system::system_error &err) {
-    closeStream();
-    throw std::runtime_error(std::string("HTTP POST ") + target +
-                             " failed: " + err.code().message());
-  }
-  HttpResponse res = parser.release();
-  buffer_.consume(buffer_.size());
-
-  if (close || res.need_eof()) {
-    closeStream();
-  }
-
-  if (res.result() != http::status::ok) {
-    closeStream();
-    throw std::runtime_error("HTTP POST " + target +
-                             " failed: " + vectorToString(res.body()));
-  }
-
-  return res;
-}
-
-EVDClient::HttpResponse EVDClient::performDelete(const std::string &target) {
-  ensureConnection();
-
-  HttpRequest req{http::verb::delete_, target, 11};
-  req.set(http::field::host, host_);
-  req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-  req.body() = {};
-  req.prepare_payload();
-  req.content_length(0);
-
-  http::write(stream_, req);
-
-  http::response_parser<HttpResponse::body_type> parser;
-  parser.body_limit(static_cast<std::uint64_t>(max_body_size_));
-  try {
-    http::read(stream_, buffer_, parser);
-  } catch (const boost::system::system_error &err) {
-    closeStream();
-    throw std::runtime_error(std::string("HTTP DELETE ") + target +
-                             " failed: " + err.code().message());
-  }
-  HttpResponse res = parser.release();
-  buffer_.consume(buffer_.size());
-
-  if (res.need_eof()) {
-    closeStream();
-  }
-
-  if (res.result() != http::status::ok) {
-    closeStream();
-    throw std::runtime_error("HTTP DELETE " + target +
-                             " failed: " + vectorToString(res.body()));
-  }
-
-  return res;
-}
-
 u64 EVDClient::setupCollection(const std::string &collectionName, u64 dimension,
                                const std::string &metric_type_str,
                                bool is_query_encrypt) {
@@ -441,50 +298,49 @@ u64 EVDClient::setupCollection(const std::string &collectionName, u64 dimension,
                                 std::to_string(DEGREE));
   }
 
+  Operation op = Operation::SETUP;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
+
   u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
+
+  // Send dimension and metric_type to server
   MetricType metric_type = stringToMetricType(metric_type_str);
+  asio::write(socket_, asio::buffer(&dimension, sizeof(dimension)));
+  asio::write(socket_, asio::buffer(&metric_type, sizeof(metric_type)));
 
-  std::vector<uint8_t> body;
-  appendBinary(body, collectionHash);
-  appendBinary(body, dimension);
-  appendBinary(body, metric_type);
-  uint8_t has_keys = 0;
-  appendBinary(body, has_keys);
+  u8 setup_status;
+  asio::read(socket_, asio::buffer(&setup_status, sizeof(setup_status)));
 
-  auto response = performPost("/collections/setup", std::move(body));
-  BinaryReader reader(response.body());
-
-  uint8_t setup_status = 0;
-  u64 server_dimension = 0;
-  MetricType server_metric_type = metric_type;
-  u64 server_db_size = 0;
-
-  if (!reader.read(setup_status) || !reader.read(server_dimension) ||
-      !reader.read(server_metric_type) || !reader.read(server_db_size)) {
-    throw std::runtime_error("Malformed setup response from server");
-  }
-
-  if (setup_status == 2) {
+  if (setup_status == 2) { // Dimension mismatch
     throw std::runtime_error("Failed to setup collection '" + collectionName +
                              "': Dimension mismatch with server.");
   }
 
-  if (setup_status == 0) {
+  if (setup_status == 0) { // Collection exists
+    u64 server_dimension;
+    MetricType server_metric_type;
+    u64 server_db_size;
+
+    asio::read(socket_,
+               asio::buffer(&server_dimension, sizeof(server_dimension)));
+    asio::read(socket_,
+               asio::buffer(&server_metric_type, sizeof(server_metric_type)));
+    asio::read(socket_, asio::buffer(&server_db_size, sizeof(server_db_size)));
+
     if (!collections_.count(collectionName)) {
       collections_[collectionName] = std::make_unique<CollectionContext>(
           server_dimension, server_metric_type, is_query_encrypt);
     }
     db_sizes_[collectionName] = server_db_size;
     logToFile("Collection '" + collectionName +
-              "' ready on server with size " +
-              std::to_string(server_db_size) + ". Setup complete.");
+                "' already exists on server with size " +
+                std::to_string(server_db_size) + ". Setup complete.");
+
     return server_db_size;
   }
 
-  if (setup_status != 1) {
-    throw std::runtime_error("Unexpected setup status from server");
-  }
-
+  // setup_status == 1 (New collection)
   if (!collections_.count(collectionName)) {
     collections_[collectionName] = std::make_unique<CollectionContext>(
         dimension, metric_type, is_query_encrypt);
@@ -511,124 +367,114 @@ u64 EVDClient::setupCollection(const std::string &collectionName, u64 dimension,
   ctx->client->genAutedModPackKeys(ctx->autedModPackKeys, secKey_);
   ctx->client->genInvAutedModPackKeys(ctx->autedModPackMLWEKeys, secKey_);
 
+  // Generate PIR-specific keys
   ctx->pirClient->genInvAutKeys(ctx->pirInvAutKeys.getKeys(), secKey_,
                                 PIR_RANK);
 
   logToFile("Collection '" + collectionName + "' is new. Sending keys...");
 
-  std::vector<uint8_t> key_body;
-  appendBinary(key_body, collectionHash);
-  appendBinary(key_body, dimension);
-  appendBinary(key_body, metric_type);
-  has_keys = 1;
-  appendBinary(key_body, has_keys);
-
-  appendBinary(key_body, ctx->relinKey.getPolyAModQ().getData(),
-               DEGREE * sizeof(u64));
-  appendBinary(key_body, ctx->relinKey.getPolyAModP().getData(),
-               DEGREE * sizeof(u64));
-  appendBinary(key_body, ctx->relinKey.getPolyBModQ().getData(),
-               DEGREE * sizeof(u64));
-  appendBinary(key_body, ctx->relinKey.getPolyBModP().getData(),
-               DEGREE * sizeof(u64));
+  asio::write(socket_, asio::buffer(ctx->relinKey.getPolyAModQ().getData(),
+                                    DEGREE * sizeof(u64)));
+  asio::write(socket_, asio::buffer(ctx->relinKey.getPolyAModP().getData(),
+                                    DEGREE * sizeof(u64)));
+  asio::write(socket_, asio::buffer(ctx->relinKey.getPolyBModQ().getData(),
+                                    DEGREE * sizeof(u64)));
+  asio::write(socket_, asio::buffer(ctx->relinKey.getPolyBModP().getData(),
+                                    DEGREE * sizeof(u64)));
 
   for (u64 i = 0; i < ctx->rank; ++i) {
     for (u64 j = 0; j < ctx->stack; ++j) {
-      auto &key = ctx->autedModPackKeys.getKeys()[i][j];
-      appendBinary(key_body, key.getPolyAModQ().getData(),
-                   DEGREE * sizeof(u64));
-      appendBinary(key_body, key.getPolyAModP().getData(),
-                   DEGREE * sizeof(u64));
-      appendBinary(key_body, key.getPolyBModQ().getData(),
-                   DEGREE * sizeof(u64));
-      appendBinary(key_body, key.getPolyBModP().getData(),
-                   DEGREE * sizeof(u64));
+      asio::write(
+          socket_,
+          asio::buffer(
+              ctx->autedModPackKeys.getKeys()[i][j].getPolyAModQ().getData(),
+              DEGREE * sizeof(u64)));
+      asio::write(
+          socket_,
+          asio::buffer(
+              ctx->autedModPackKeys.getKeys()[i][j].getPolyAModP().getData(),
+              DEGREE * sizeof(u64)));
+      asio::write(
+          socket_,
+          asio::buffer(
+              ctx->autedModPackKeys.getKeys()[i][j].getPolyBModQ().getData(),
+              DEGREE * sizeof(u64)));
+      asio::write(
+          socket_,
+          asio::buffer(
+              ctx->autedModPackKeys.getKeys()[i][j].getPolyBModP().getData(),
+              DEGREE * sizeof(u64)));
     }
   }
 
   for (u64 i = 0; i < ctx->rank; ++i) {
     for (u64 j = 0; j < ctx->stack; ++j) {
-      auto &key = ctx->autedModPackMLWEKeys.getKeys()[i][j];
       for (u64 k = 0; k < ctx->stack; ++k) {
-        appendBinary(key_body, key.getPolyAModQ(k).getData(),
-                     ctx->rank * sizeof(u64));
-        appendBinary(key_body, key.getPolyAModP(k).getData(),
-                     ctx->rank * sizeof(u64));
-        appendBinary(key_body, key.getPolyBModQ(k).getData(),
-                     ctx->rank * sizeof(u64));
-        appendBinary(key_body, key.getPolyBModP(k).getData(),
-                     ctx->rank * sizeof(u64));
+        asio::write(socket_,
+                    asio::buffer(ctx->autedModPackMLWEKeys.getKeys()[i][j]
+                                     .getPolyAModQ(k)
+                                     .getData(),
+                                 ctx->rank * sizeof(u64)));
+        asio::write(socket_,
+                    asio::buffer(ctx->autedModPackMLWEKeys.getKeys()[i][j]
+                                     .getPolyAModP(k)
+                                     .getData(),
+                                 ctx->rank * sizeof(u64)));
+        asio::write(socket_,
+                    asio::buffer(ctx->autedModPackMLWEKeys.getKeys()[i][j]
+                                     .getPolyBModQ(k)
+                                     .getData(),
+                                 ctx->rank * sizeof(u64)));
+        asio::write(socket_,
+                    asio::buffer(ctx->autedModPackMLWEKeys.getKeys()[i][j]
+                                     .getPolyBModP(k)
+                                     .getData(),
+                                 ctx->rank * sizeof(u64)));
       }
     }
   }
 
+  // Send PIR InvAutKeys
   for (u64 i = 0; i < PIR_RANK; ++i) {
-    auto &key = ctx->pirInvAutKeys.getKeys()[i];
-    appendBinary(key_body, key.getPolyAModQ().getData(),
-                 DEGREE * sizeof(u64));
-    appendBinary(key_body, key.getPolyAModP().getData(),
-                 DEGREE * sizeof(u64));
-    appendBinary(key_body, key.getPolyBModQ().getData(),
-                 DEGREE * sizeof(u64));
-    appendBinary(key_body, key.getPolyBModP().getData(),
-                 DEGREE * sizeof(u64));
+    asio::write(
+        socket_,
+        asio::buffer(ctx->pirInvAutKeys.getKeys()[i].getPolyAModQ().getData(),
+                     DEGREE * sizeof(u64)));
+    asio::write(
+        socket_,
+        asio::buffer(ctx->pirInvAutKeys.getKeys()[i].getPolyAModP().getData(),
+                     DEGREE * sizeof(u64)));
+    asio::write(
+        socket_,
+        asio::buffer(ctx->pirInvAutKeys.getKeys()[i].getPolyBModQ().getData(),
+                     DEGREE * sizeof(u64)));
+    asio::write(
+        socket_,
+        asio::buffer(ctx->pirInvAutKeys.getKeys()[i].getPolyBModP().getData(),
+                     DEGREE * sizeof(u64)));
   }
 
-  auto final_response =
-      performPost("/collections/setup", std::move(key_body));
-  BinaryReader final_reader(final_response.body());
-
-  uint8_t final_status = 0;
-  u64 final_dimension = 0;
-  MetricType final_metric_type = metric_type;
-  u64 final_db_size = 0;
-
-  if (!final_reader.read(final_status) ||
-      !final_reader.read(final_dimension) ||
-      !final_reader.read(final_metric_type) ||
-      !final_reader.read(final_db_size)) {
-    throw std::runtime_error("Malformed setup confirmation from server");
-  }
-
-  if (final_status == 2) {
-    throw std::runtime_error("Server reported dimension mismatch after key "
-                             "upload for collection '" +
-                             collectionName + "'");
-  }
-
-  if (final_status != 0) {
-    throw std::runtime_error("Unexpected setup confirmation status");
-  }
-
-  db_sizes_[collectionName] = final_db_size;
-  logToFile("Collection '" + collectionName + "' registered on server.");
-
-  return final_db_size;
+  return 0; // New collection starts with size 0
 }
-
 
 void EVDClient::terminate() {
-  try {
-    performPost("/terminate", {}, true);
-  } catch (const std::exception &) {
-    boost::beast::error_code ec;
-    if (stream_.socket().is_open()) {
-      stream_.socket().close(ec);
-    }
-  }
+  Operation op = Operation::TERMINATE;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
 }
 
-
 void EVDClient::dropCollection(const std::string &collectionName) {
-  u64 collectionHash = std::hash<std::string>{}(collectionName);
-  performDelete("/collections/" + std::to_string(collectionHash));
+  Operation op = Operation::DROP_COLLECTION;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
 
+  u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
+
+  // Remove from client-side collections
   collections_.erase(collectionName);
   db_sizes_.erase(collectionName);
 
   logToFile("Dropped collection '" + collectionName + "'");
 }
-
 
 void EVDClient::insert(const std::string &collectionName,
                        const std::vector<std::vector<float>> &db,
@@ -656,19 +502,17 @@ void EVDClient::insert(const std::string &collectionName,
 
   auto whole_start = std::chrono::high_resolution_clock::now();
 
-  u64 collectionHash = std::hash<std::string>{}(collectionName);
-  u64 num_to_insert = db.size();
+  Operation op = Operation::INSERT;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
 
-  std::vector<uint8_t> body;
-  body.reserve(sizeof(collectionHash) + sizeof(num_to_insert) +
-               num_to_insert * (ctx->stack * ctx->rank * sizeof(u64) +
-                                ctx->rank * sizeof(u64) + PIR_PAYLOAD_SIZE));
-  appendBinary(body, collectionHash);
-  appendBinary(body, num_to_insert);
+  u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
+
+  u64 num_to_insert = db.size();
+  asio::write(socket_, asio::buffer(&num_to_insert, sizeof(num_to_insert)));
 
   u64 current_db_size = db_sizes_.at(collectionName);
   std::string aes_payload(PIR_PAYLOAD_SIZE, '\0');
-
   for (size_t i = 0; i < db.size(); ++i) {
     const auto &vec = db[i];
     Message msg(ctx->rank);
@@ -678,29 +522,26 @@ void EVDClient::insert(const std::string &collectionName,
     MLWECiphertext key_to_send(ctx->rank);
     ctx->client->encryptKey(key_to_send, msg, secKey_, ctx->keyScale);
 
-    for (u64 k = 0; k < ctx->stack; ++k) {
-      appendBinary(body, key_to_send.getA(k).getData(),
-                   ctx->rank * sizeof(u64));
-    }
-    appendBinary(body, key_to_send.getB().getData(),
-                 ctx->rank * sizeof(u64));
+    for (u64 k = 0; k < ctx->stack; ++k)
+      asio::write(socket_, asio::buffer(key_to_send.getA(k).getData(),
+                                        ctx->rank * sizeof(u64)));
+    asio::write(socket_, asio::buffer(key_to_send.getB().getData(),
+                                      ctx->rank * sizeof(u64)));
 
+    // Encrypt and Send payload
     u64 global_idx = current_db_size + i;
     encryptPayload(payloads[i], aes_payload, aesKey_, global_idx);
-    appendBinary(body, aes_payload.data(), PIR_PAYLOAD_SIZE);
+    asio::write(socket_, asio::buffer(aes_payload.data(), PIR_PAYLOAD_SIZE));
   }
-
-  performPost("/collections/insert", std::move(body));
 
   db_sizes_.at(collectionName) += num_to_insert;
   auto whole_end = std::chrono::high_resolution_clock::now();
   auto whole_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       whole_end - whole_start);
   logToFile("Sent " + std::to_string(num_to_insert) +
-            " keys to server. Total time: " +
-            std::to_string(whole_duration.count()) + "ms");
+              " keys to server. Total time: " +
+              std::to_string(whole_duration.count()) + "ms");
 }
-
 
 std::vector<float> EVDClient::query(const std::string &collectionName,
                                     const std::vector<float> &query_vec) {
@@ -721,72 +562,67 @@ std::vector<float> EVDClient::query(const std::string &collectionName,
 
   auto whole_start = std::chrono::high_resolution_clock::now();
 
+  Operation op = ctx->isQueryEncrypt ? Operation::QUERY : Operation::QUERY_PTXT;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
+
   u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
+
   const u64 iter = (db_sizes_.at(collectionName) + DEGREE - 1) / DEGREE;
 
   Message msg(ctx->rank);
   for (u64 j = 0; j < query_vec.size(); ++j)
     msg[j] = query_vec[j];
 
-  std::vector<uint8_t> request_body;
-  appendBinary(request_body, collectionHash);
-
-  auto start_enc = std::chrono::high_resolution_clock::now();
+  auto start = std::chrono::high_resolution_clock::now();
 
   if (ctx->isQueryEncrypt) {
     MLWECiphertext query(ctx->rank);
     ctx->client->encryptQuery(query, msg, secKey_, ctx->queryScale);
 
-    for (u64 i = 0; i < ctx->stack; ++i) {
-      appendBinary(request_body, query.getA(i).getData(),
-                   ctx->rank * sizeof(u64));
-    }
-    appendBinary(request_body, query.getB().getData(),
-                 ctx->rank * sizeof(u64));
+    for (u64 i = 0; i < ctx->stack; ++i)
+      asio::write(socket_, asio::buffer(query.getA(i).getData(),
+                                        ctx->rank * sizeof(u64)));
+    asio::write(socket_,
+                asio::buffer(query.getB().getData(), ctx->rank * sizeof(u64)));
   } else {
     Polynomial query(ctx->rank, MOD_Q);
     ctx->client->encodeQuery(query, msg, ctx->queryScale);
-    appendBinary(request_body, query.getData(), ctx->rank * sizeof(u64));
+
+    asio::write(socket_,
+                asio::buffer(query.getData(), ctx->rank * sizeof(u64)));
   }
 
-  auto end_enc = std::chrono::high_resolution_clock::now();
-  auto duration_enc = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_enc - start_enc);
-  logToFile("Encrypt/Encode query: " + std::to_string(duration_enc.count()) +
-            "ms");
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+  logToFile("Encrypt/Encode query: " + std::to_string(duration.count()) +
+              "ms");
 
-  auto start_rt = std::chrono::high_resolution_clock::now();
-  const char *endpoint =
-      ctx->isQueryEncrypt ? "/collections/query" : "/collections/query_ptxt";
-  auto response = performPost(endpoint, std::move(request_body));
-  auto end_rt = std::chrono::high_resolution_clock::now();
-  auto duration_rt = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_rt - start_rt);
-
+  start = std::chrono::high_resolution_clock::now();
   std::vector<Ciphertext> ret(iter);
   std::vector<Message> dmsg;
   dmsg.reserve(iter);
   for (u64 j = 0; j < iter; ++j)
     dmsg.emplace_back(DEGREE);
 
-  BinaryReader reader(response.body());
   for (u64 i = 0; i < iter; ++i) {
-    if (!reader.readBytes(ret[i].getA().getData(), DEGREE * sizeof(u64)) ||
-        !reader.readBytes(ret[i].getB().getData(), DEGREE * sizeof(u64))) {
-      throw std::runtime_error("Malformed query response from server");
-    }
+    asio::read(socket_,
+               asio::buffer(ret[i].getA().getData(), DEGREE * sizeof(u64)));
     ret[i].getA().setIsNTT(true);
+    asio::read(socket_,
+               asio::buffer(ret[i].getB().getData(), DEGREE * sizeof(u64)));
     ret[i].getB().setIsNTT(true);
   }
-  logToFile("Query round trip: " + std::to_string(duration_rt.count()) +
-            "ms");
+  end = std::chrono::high_resolution_clock::now();
+  duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+  logToFile("Query round trip: " + std::to_string(duration.count()) + "ms");
 
-  auto start_dec = std::chrono::high_resolution_clock::now();
+  start = std::chrono::high_resolution_clock::now();
   ctx->client->decryptScore(dmsg, ret, secKey_, ctx->outputScale);
-  auto end_dec = std::chrono::high_resolution_clock::now();
-  auto duration_dec = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_dec - start_dec);
-  logToFile("Decrypt score: " + std::to_string(duration_dec.count()) + "ms");
+  end = std::chrono::high_resolution_clock::now();
+  duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+  logToFile("Decrypt score: " + std::to_string(duration.count()) + "ms");
 
   std::vector<float> results;
   results.reserve(db_sizes_.at(collectionName));
@@ -802,10 +638,9 @@ std::vector<float> EVDClient::query(const std::string &collectionName,
   auto whole_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       whole_end - whole_start);
   logToFile("Total query time: " + std::to_string(whole_duration.count()) +
-            "ms");
+              "ms");
   return results;
 }
-
 
 void EVDClient::queryAndTopK(TopK &res, const std::string &collectionName,
                              const std::vector<float> &query_vec) {
@@ -829,73 +664,79 @@ void EVDClient::queryAndTopK(TopK &res, const std::string &collectionName,
 
   auto whole_start = std::chrono::high_resolution_clock::now();
 
+  // --- Network and crypto part, same as in query() ---
+  Operation op = ctx->isQueryEncrypt ? Operation::QUERY : Operation::QUERY_PTXT;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
+
   u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
+
   const u64 iter = (db_size + DEGREE - 1) / DEGREE;
 
   Message msg(ctx->rank);
   for (u64 j = 0; j < query_vec.size(); ++j)
     msg[j] = query_vec[j];
 
-  std::vector<uint8_t> request_body;
-  appendBinary(request_body, collectionHash);
-
   auto start_enc = std::chrono::high_resolution_clock::now();
 
   if (ctx->isQueryEncrypt) {
+    // Encrypted query logic
     MLWECiphertext query(ctx->rank);
     ctx->client->encryptQuery(query, msg, secKey_, ctx->queryScale);
-    for (u64 i = 0; i < ctx->stack; ++i) {
-      appendBinary(request_body, query.getA(i).getData(),
-                   ctx->rank * sizeof(u64));
-    }
-    appendBinary(request_body, query.getB().getData(),
-                 ctx->rank * sizeof(u64));
+
+    for (u64 i = 0; i < ctx->stack; ++i)
+      asio::write(socket_, asio::buffer(query.getA(i).getData(),
+                                        ctx->rank * sizeof(u64)));
+    asio::write(socket_,
+                asio::buffer(query.getB().getData(), ctx->rank * sizeof(u64)));
   } else {
+    // Plaintext query logic
     Polynomial query(ctx->rank, MOD_Q);
     ctx->client->encodeQuery(query, msg, ctx->queryScale);
-    appendBinary(request_body, query.getData(), ctx->rank * sizeof(u64));
+
+    asio::write(socket_,
+                asio::buffer(query.getData(), ctx->rank * sizeof(u64)));
   }
 
   auto end_enc = std::chrono::high_resolution_clock::now();
   auto duration_enc = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_enc - start_enc);
   logToFile("Encrypt/Encode query: " + std::to_string(duration_enc.count()) +
-            "ms");
+              "ms");
 
-  const char *endpoint =
-      ctx->isQueryEncrypt ? "/collections/query" : "/collections/query_ptxt";
   auto start_rt = std::chrono::high_resolution_clock::now();
-  auto response = performPost(endpoint, std::move(request_body));
-  auto end_rt = std::chrono::high_resolution_clock::now();
-  auto duration_rt = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_rt - start_rt);
-
   std::vector<Ciphertext> ret(iter);
-  BinaryReader reader(response.body());
   for (u64 i = 0; i < iter; ++i) {
-    if (!reader.readBytes(ret[i].getA().getData(), DEGREE * sizeof(u64)) ||
-        !reader.readBytes(ret[i].getB().getData(), DEGREE * sizeof(u64))) {
-      throw std::runtime_error("Malformed query response from server");
-    }
+    asio::read(socket_,
+               asio::buffer(ret[i].getA().getData(), DEGREE * sizeof(u64)));
     ret[i].getA().setIsNTT(true);
+    asio::read(socket_,
+               asio::buffer(ret[i].getB().getData(), DEGREE * sizeof(u64)));
     ret[i].getB().setIsNTT(true);
   }
+  auto end_rt = std::chrono::high_resolution_clock::now();
+  auto duration_rt =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end_rt - start_rt);
   logToFile("Query round trip: " + std::to_string(duration_rt.count()) +
-            "ms");
+              "ms");
 
+  // --- Decrypt all scores ---
   std::vector<Message> dmsg;
   dmsg.reserve(iter);
   for (u64 j = 0; j < iter; ++j)
     dmsg.emplace_back(DEGREE);
 
   auto start_decrypt = std::chrono::high_resolution_clock::now();
+
   ctx->client->decryptScore(dmsg, ret, secKey_, ctx->outputScale);
+
   auto end_decrypt = std::chrono::high_resolution_clock::now();
   auto duration_decrypt = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_decrypt - start_decrypt);
   logToFile("Decrypt score: " + std::to_string(duration_decrypt.count()) +
-            "ms");
+              "ms");
 
+  // --- Efficient Top-K using a min-heap ---
   auto start_topk = std::chrono::high_resolution_clock::now();
 
   using Pair = std::pair<double, u64>;
@@ -932,15 +773,14 @@ void EVDClient::queryAndTopK(TopK &res, const std::string &collectionName,
   auto duration_topk = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_topk - start_topk);
   logToFile("Top-K calculation: " + std::to_string(duration_topk.count()) +
-            "ms");
+              "ms");
 
   auto whole_end = std::chrono::high_resolution_clock::now();
   auto whole_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       whole_end - whole_start);
   logToFile("Total queryAndTopK time: " +
-            std::to_string(whole_duration.count()) + "ms");
+              std::to_string(whole_duration.count()) + "ms");
 }
-
 
 void EVDClient::queryAndTopKWithScores(std::vector<std::pair<u64, float>> &res,
                                        const std::string &collectionName,
@@ -966,60 +806,63 @@ void EVDClient::queryAndTopKWithScores(std::vector<std::pair<u64, float>> &res,
 
   auto whole_start = std::chrono::high_resolution_clock::now();
 
+  // --- Network and crypto part, same as in query() ---
+  Operation op = ctx->isQueryEncrypt ? Operation::QUERY : Operation::QUERY_PTXT;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
+
   u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
+
   const u64 iter = (db_size + DEGREE - 1) / DEGREE;
 
   Message msg(ctx->rank);
   for (u64 j = 0; j < query_vec.size(); ++j)
     msg[j] = query_vec[j];
 
-  std::vector<uint8_t> request_body;
-  appendBinary(request_body, collectionHash);
-
   auto start_enc = std::chrono::high_resolution_clock::now();
 
   if (ctx->isQueryEncrypt) {
+    // Encrypted query logic
     MLWECiphertext query(ctx->rank);
     ctx->client->encryptQuery(query, msg, secKey_, ctx->queryScale);
-    for (u64 i = 0; i < ctx->stack; ++i) {
-      appendBinary(request_body, query.getA(i).getData(),
-                   ctx->rank * sizeof(u64));
-    }
-    appendBinary(request_body, query.getB().getData(),
-                 ctx->rank * sizeof(u64));
+
+    for (u64 i = 0; i < ctx->stack; ++i)
+      asio::write(socket_, asio::buffer(query.getA(i).getData(),
+                                        ctx->rank * sizeof(u64)));
+    asio::write(socket_,
+                asio::buffer(query.getB().getData(), ctx->rank * sizeof(u64)));
   } else {
+    // Plaintext query logic
     Polynomial query(ctx->rank, MOD_Q);
     ctx->client->encodeQuery(query, msg, ctx->queryScale);
-    appendBinary(request_body, query.getData(), ctx->rank * sizeof(u64));
+
+    asio::write(socket_,
+                asio::buffer(query.getData(), ctx->rank * sizeof(u64)));
   }
 
   auto end_enc = std::chrono::high_resolution_clock::now();
   auto duration_enc = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_enc - start_enc);
   logToFile("Encrypt/Encode query: " + std::to_string(duration_enc.count()) +
-            "ms");
+              "ms");
 
-  const char *endpoint =
-      ctx->isQueryEncrypt ? "/collections/query" : "/collections/query_ptxt";
   auto start_rt = std::chrono::high_resolution_clock::now();
-  auto response = performPost(endpoint, std::move(request_body));
-  auto end_rt = std::chrono::high_resolution_clock::now();
-  auto duration_rt = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_rt - start_rt);
-
   std::vector<Ciphertext> ret(iter);
-  BinaryReader reader(response.body());
   for (u64 i = 0; i < iter; ++i) {
-    if (!reader.readBytes(ret[i].getA().getData(), DEGREE * sizeof(u64)) ||
-        !reader.readBytes(ret[i].getB().getData(), DEGREE * sizeof(u64))) {
-      throw std::runtime_error("Malformed query response from server");
-    }
+    asio::read(socket_,
+               asio::buffer(ret[i].getA().getData(), DEGREE * sizeof(u64)));
     ret[i].getA().setIsNTT(true);
+    asio::read(socket_,
+               asio::buffer(ret[i].getB().getData(), DEGREE * sizeof(u64)));
     ret[i].getB().setIsNTT(true);
   }
+  auto end_rt = std::chrono::high_resolution_clock::now();
+  auto duration_rt =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end_rt - start_rt);
   logToFile("Query round trip: " + std::to_string(duration_rt.count()) +
-            "ms");
+              "ms");
 
+  // --- Decrypt all scores ---
   std::vector<Message> dmsg;
   dmsg.reserve(iter);
   for (u64 j = 0; j < iter; ++j)
@@ -1031,8 +874,9 @@ void EVDClient::queryAndTopKWithScores(std::vector<std::pair<u64, float>> &res,
   auto duration_decrypt = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_decrypt - start_decrypt);
   logToFile("Decrypt score: " + std::to_string(duration_decrypt.count()) +
-            "ms");
+              "ms");
 
+  // --- Efficient Top-K using a min-heap ---
   auto start_topk = std::chrono::high_resolution_clock::now();
 
   using Pair = std::pair<double, u64>;
@@ -1060,6 +904,7 @@ void EVDClient::queryAndTopKWithScores(std::vector<std::pair<u64, float>> &res,
     }
   }
 
+  // Convert to result format: (index, score) pairs
   res.clear();
   res.reserve(k);
   std::vector<std::pair<u64, float>> temp_results;
@@ -1071,6 +916,7 @@ void EVDClient::queryAndTopKWithScores(std::vector<std::pair<u64, float>> &res,
     min_heap.pop();
   }
 
+  // Reverse to get highest scores first
   std::reverse(temp_results.begin(), temp_results.end());
   res = std::move(temp_results);
 
@@ -1078,15 +924,14 @@ void EVDClient::queryAndTopKWithScores(std::vector<std::pair<u64, float>> &res,
   auto duration_topk = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_topk - start_topk);
   logToFile("Top-K calculation: " + std::to_string(duration_topk.count()) +
-            "ms");
+              "ms");
 
   auto whole_end = std::chrono::high_resolution_clock::now();
   auto whole_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       whole_end - whole_start);
   logToFile("Total queryAndTopKWithScores time: " +
-            std::to_string(whole_duration.count()) + "ms");
+              std::to_string(whole_duration.count()) + "ms");
 }
-
 
 std::vector<u64> EVDClient::getTopKIndices(const std::vector<float> &scores,
                                            u64 k) {
@@ -1141,29 +986,24 @@ std::string EVDClient::retrieve(const std::string &collectionName, u64 index) {
                                 " does not exist.");
   }
 
+  Operation op = Operation::RETRIEVE;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
+
   u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
 
-  std::vector<uint8_t> body;
-  appendBinary(body, collectionHash);
   u64 num_indices = 1;
-  appendBinary(body, num_indices);
-  appendBinary(body, index);
-
-  auto response = performPost("/collections/retrieve", std::move(body));
-
-  if (response.body().size() != PIR_PAYLOAD_SIZE) {
-    throw std::runtime_error("Malformed retrieve response from server");
-  }
+  asio::write(socket_, asio::buffer(&num_indices, sizeof(num_indices)));
+  asio::write(socket_, asio::buffer(&index, sizeof(index)));
 
   std::string aes_payload(PIR_PAYLOAD_SIZE, '\0');
-  std::memcpy(aes_payload.data(), response.body().data(), PIR_PAYLOAD_SIZE);
-
   std::string decrypted_payload;
+
+  asio::read(socket_, asio::buffer(&aes_payload[0], PIR_PAYLOAD_SIZE));
   decryptPayload(aes_payload, decrypted_payload, aesKey_, index);
 
   return decrypted_payload;
 }
-
 
 std::string EVDClient::retrievePIR(const std::string &collectionName,
                                    u64 index) {
@@ -1180,51 +1020,62 @@ std::string EVDClient::retrievePIR(const std::string &collectionName,
                                 std::to_string(db_size));
   }
 
+  // Check PIR capacity
   const u64 pir_db_size = PIR_RANK * PIR_RANK;
   if (db_size > pir_db_size) {
     throw std::runtime_error("Database size exceeds PIR capacity. Max size: " +
                              std::to_string(pir_db_size));
   }
 
+  Operation op = Operation::PIR_RETRIEVE;
+  asio::write(socket_, asio::buffer(&op, sizeof(op)));
+
   u64 collectionHash = std::hash<std::string>{}(collectionName);
+  asio::write(socket_, asio::buffer(&collectionHash, sizeof(collectionHash)));
 
-  const double first_scale = std::pow(2.0, PIR_FIRST_SCALE);
-  const double second_scale = std::pow(2.0, PIR_SECOND_SCALE);
-
+  // Send encrypted PIR queries using PIR-specific scale
+  const double scale = std::pow(2.0, PIR_FIRST_SCALE);
   Ciphertext firstDim, secondDim;
+
+  // Compute 2D indices for PIR grid
   u64 row = index / PIR_RANK;
   u64 col = index % PIR_RANK;
 
-  ctx->pirClient->encryptPIR(firstDim, row, secKey_, first_scale);
-  ctx->pirClient->encryptPIR(secondDim, col, secKey_, second_scale);
+  ctx->pirClient->encryptPIR(firstDim, row, secKey_, scale);
+  ctx->pirClient->encryptPIR(secondDim, col, secKey_,
+                             std::pow(2.0, PIR_SECOND_SCALE));
 
-  std::vector<uint8_t> body;
-  appendBinary(body, collectionHash);
-  appendBinary(body, firstDim.getA().getData(), DEGREE * sizeof(u64));
-  appendBinary(body, firstDim.getB().getData(), DEGREE * sizeof(u64));
-  appendBinary(body, secondDim.getA().getData(), DEGREE * sizeof(u64));
-  appendBinary(body, secondDim.getB().getData(), DEGREE * sizeof(u64));
+  // Send first dimension query
+  asio::write(socket_,
+              asio::buffer(firstDim.getA().getData(), DEGREE * sizeof(u64)));
+  asio::write(socket_,
+              asio::buffer(firstDim.getB().getData(), DEGREE * sizeof(u64)));
 
-  auto response = performPost("/collections/pir_retrieve", std::move(body));
+  // Send second dimension query
+  asio::write(socket_,
+              asio::buffer(secondDim.getA().getData(), DEGREE * sizeof(u64)));
+  asio::write(socket_,
+              asio::buffer(secondDim.getB().getData(), DEGREE * sizeof(u64)));
 
-  if (response.body().size() != 2 * DEGREE * sizeof(u64)) {
-    throw std::runtime_error("Malformed PIR retrieve response from server");
-  }
-
-  BinaryReader reader(response.body());
+  // Receive encrypted result
   Ciphertext result;
-  reader.readBytes(result.getA().getData(), DEGREE * sizeof(u64));
-  reader.readBytes(result.getB().getData(), DEGREE * sizeof(u64));
+  asio::read(socket_,
+             asio::buffer(result.getA().getData(), DEGREE * sizeof(u64)));
   result.getA().setIsNTT(true);
+  asio::read(socket_,
+             asio::buffer(result.getB().getData(), DEGREE * sizeof(u64)));
   result.getB().setIsNTT(true);
 
+  // Decrypt the result
   Message dmsg(DEGREE);
   const double doubleScale = std::pow(2.0, PIR_FIRST_SCALE + PIR_SECOND_SCALE);
   ctx->pirClient->decrypt(dmsg, result, secKey_, doubleScale);
 
+  // Decode PIR payload from polynomial
   unsigned char aes_payload[PIR_PAYLOAD_SIZE];
   ctx->pirClient->decodePIRPayload(aes_payload, dmsg);
 
+  // Decrypt AES payload
   std::string decrypted_payload;
   decryptPayload(
       std::string(reinterpret_cast<char *>(aes_payload), PIR_PAYLOAD_SIZE),
@@ -1232,6 +1083,5 @@ std::string EVDClient::retrievePIR(const std::string &collectionName,
 
   return decrypted_payload;
 }
-
 
 } // namespace evd

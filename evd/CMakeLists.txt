@@ -15,24 +15,15 @@ option(BUILD_HEXL "Build HEXL from source" ON)
 option(BUILD_PYTHON "Build Python bindings" OFF)
 
 add_library(
-  evd
-  src/Client.cpp
-  src/EVDClient.cpp
-  src/EVDServer.cpp
-  src/HEval.cpp
-  src/PIRServer.cpp
-  src/Random.cpp
-  src/Server.cpp
-  src/SecretKey.cpp)
+  evd src/Client.cpp src/EVDClient.cpp src/EVDServer.cpp src/HEval.cpp
+      src/PIRServer.cpp src/Random.cpp src/Server.cpp src/SecretKey.cpp)
 
 target_include_directories(
-  evd PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  evd PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+             $<INSTALL_INTERFACE:include>)
 
 include(FetchContent)
 
-# ---------- HEXL ----------
 if(BUILD_HEXL)
   FetchContent_Declare(
     hexl
@@ -45,36 +36,18 @@ else()
   find_package(hexl REQUIRED)
 endif()
 
-# ---------- OpenSSL / OpenMP / Threads ----------
+FetchContent_Declare(
+  asio
+  URL https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.zip)
+FetchContent_MakeAvailable(asio)
+
 find_package(OpenSSL REQUIRED)
 find_package(OpenMP REQUIRED)
-find_package(Threads REQUIRED)
 
-# ---------- Boost (Beast는 헤더 전용) ----------
-find_package(Boost 1.75 REQUIRED COMPONENTS system)
-
-if(Boost_FOUND)
-  target_include_directories(evd PUBLIC ${Boost_INCLUDE_DIRS})
-  target_link_libraries(evd PUBLIC Boost::system)
-endif()
-
-# ---------- 링크 ----------
 target_include_directories(evd PUBLIC ${hexl_INCLUDE_DIRS})
-target_link_libraries(evd
-  PUBLIC
-    hexl
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    OpenMP::OpenMP_CXX
-    Threads::Threads
-)
+target_link_libraries(evd PUBLIC hexl crypto OpenMP::OpenMP_CXX OpenSSL::SSL OpenSSL::Crypto)
 
-# (선택) Windows에서 정적 링크 시 소켓 라이브러리 필요할 수 있음
-if(WIN32)
-  target_link_libraries(evd PUBLIC ws2_32 mswsock)
-endif()
-
-# ---------- Python Binding ----------
+# Python bindings
 if(BUILD_PYTHON)
   find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
   FetchContent_Declare(
@@ -86,12 +59,13 @@ if(BUILD_PYTHON)
   pybind11_add_module(evd_py python/bindings.cpp)
   target_link_libraries(evd_py PRIVATE evd)
   target_include_directories(evd_py PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  
+  # Set output directory for Python module
   set_target_properties(evd_py PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
     PREFIX "")
 endif()
 
-# ---------- Install ----------
 include(GNUInstallDirs)
 install(
   TARGETS evd
@@ -99,10 +73,9 @@ install(
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-
+  INCLUDES
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-
 install(
   EXPORT evdTargets
   FILE evdConfig.cmake
@@ -114,6 +87,5 @@ write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/evdConfigVersion.cmake"
   VERSION ${PROJECT_VERSION}
   COMPATIBILITY AnyNewerVersion)
-
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/evdConfigVersion.cmake"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/evd)
